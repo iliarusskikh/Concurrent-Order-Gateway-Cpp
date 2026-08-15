@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Theory Notes — Concurrent Order Gateway</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+</head>
+<body>
+<div class="layout" style="grid-template-columns: minmax(0, 780px);">
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">Theory <span class="brace">{</span> Concepts behind the code <span class="brace">}</span></h1>
+      <p class="subtitle">Notes on concurrency, ownership, latency, and testing as used in this repository. Companion to the LOB (matching) and TCP MDS (feeds). Not a build tutorial — open the headers while you read.</p>
+    </header>
+
+    <section>
+      <div class="section-head"><span class="idx">01</span><h2>Reading order</h2></div>
+      <p class="dim">Dependency order. Each note points at concrete files under <code class="inline">include/</code>.</p>
+      <ol class="index-list">
+        <li>
+          <a href="Theory_Architecture.html">
+            <span class="order">foundation</span>
+            <div class="name">Architecture &amp; decisions</div>
+            <p class="desc">Pipeline, scenario DSL, thread roles, modules, locked choices.</p>
+          </a>
+        </li>
+        <li>
+          <a href="Theory_Concurrency.html">
+            <span class="order">concurrency</span>
+            <div class="name">Concurrency</div>
+            <p class="desc">Sharding, SPSC vs MPSC, mutex/CV/atomics, backpressure, shutdown.</p>
+          </a>
+        </li>
+        <li>
+          <a href="Theory_Ownership_And_Language.html">
+            <span class="order">ownership · language</span>
+            <div class="name">Ownership &amp; language</div>
+            <p class="desc">Moves across queues, <code class="inline">ThreadGuard</code>, <code class="inline">unique_ptr</code>, templates, lambdas.</p>
+          </a>
+        </li>
+        <li>
+          <a href="Theory_Latency_And_Clocks.html">
+            <span class="order">stats</span>
+            <div class="name">Latency &amp; clocks</div>
+            <p class="desc"><code class="inline">steady_clock</code>, queue_wait / match_duration / match_to_publish, percentiles.</p>
+          </a>
+        </li>
+        <li>
+          <a href="Theory_Testing_And_Correctness.html">
+            <span class="order">correctness</span>
+            <div class="name">Testing &amp; correctness</div>
+            <p class="desc">LOB goldens, concurrency smoke, invariants, sanitizers.</p>
+          </a>
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <div class="section-head"><span class="idx">02</span><h2>Language reference</h2></div>
+      <ol class="index-list">
+        <li>
+          <a href="Theory_CodeRef.html">
+            <span class="order">C++</span>
+            <div class="name">C++ Code Reference</div>
+            <p class="desc">Feature → file map for threads, sync, move, templates, chrono used in this tree.</p>
+          </a>
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <div class="section-head"><span class="idx">03</span><h2>Not covered here</h2></div>
+      <p class="dim">TCP framing (MDS), matching rules (LOB), lock-free rings, epoll, FIX/TLS, NUMA — out of v1. See <a href="../PLAN.md">PLAN.md</a>.</p>
+    </section>
+
+    <footer>
+      <a href="../PLAN.md">PLAN.md</a> · <a href="../README.md">README.md</a>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

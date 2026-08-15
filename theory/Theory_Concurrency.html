@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Concurrency — Knowledge Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <a class="back" href="index.html">← Theory index</a>
+    <span class="toc-label">Contents</span>
+    <ol id="toc-list">
+      <li><a href="#core"><span class="num">01</span>Core model</a></li>
+      <li><a href="#roles"><span class="num">02</span>Threads &amp; shards</a></li>
+      <li><a href="#book"><span class="num">03</span>Single-threaded book</a></li>
+      <li><a href="#spsc"><span class="num">04</span>SPSC topology</a></li>
+      <li><a href="#api"><span class="num">05</span>Bounded queue API</a></li>
+      <li><a href="#sync"><span class="num">06</span>Mutex, CV, wakes</a></li>
+      <li><a href="#atomics"><span class="num">07</span>Atomics</a></li>
+      <li><a href="#backpressure"><span class="num">08</span>Backpressure</a></li>
+      <li><a href="#shutdown"><span class="num">09</span>Shutdown order</a></li>
+      <li><a href="#pitfalls"><span class="num">10</span>Pitfalls &amp; decisions</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">Concurrency <span class="brace">{</span> Shards, queues, sync <span class="brace">}</span></h1>
+      <p class="subtitle">How this pipeline stays correct under load: one owner thread per book, bounded SPSC between stages, mutex+CV inside the queues, atomics for control flags, and an explicit full-queue policy.</p>
+    </header>
+
+    <section id="core">
+      <div class="section-head"><span class="idx">01</span><h2>Core model</h2></div>
+      <p>Matching cares about <strong>orderability per instrument</strong>. Two threads mutating the same price-time book without a careful protocol is a correctness bug, not a performance tweak.</p>
+      <p>The structural rule: <strong>one thread owns each book</strong>. Parallelism comes from running many symbols at once, plus concurrent ingress and publishing. Cross-thread communication is queues and a few atomics — not shared mutable LOB state.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>pipeline (multi-symbol)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-text">gateway (main / batch thread)
+    │  route by symbol_id
+    ├─ try_push → ingress[0] → matcher0 (engine0) → events[0] ─┐
+    ├─ try_push → ingress[1] → matcher1 (engine1) → events[1] ─┼→ publisher
+    └─ try_push → ingress[N] → matcherN (engineN) → events[N] ─┘</code></pre>
+      </div>
+      <div class="card">
+        <span class="card-label">Where in this codebase</span>
+        <p>The picture above is the header comment in <code class="inline">include/multi_symbol_pipeline.hpp</code>. One-symbol mode is the same idea with a single shard.</p>
+      </div>
+    </section>
+
+    <section id="roles">
+      <div class="section-head"><span class="idx">02</span><h2>Thread roles &amp; shard-by-symbol</h2></div>
+      <p><strong>Shard-by-symbol</strong> means each instrument maps to its own ingress queue, matching engine, and outbound event queue. Orders for symbol A never touch worker B’s book.</p>
+      <table>
+        <tr><th>Thread</th><th>Owns</th><th>Talks to</th></tr>
+        <tr>
+          <td>Gateway (batch producer)</td>
+          <td>Routing by <code class="inline">symbol_id</code></td>
+          <td>Produces into each shard’s ingress SPSC</td>
+        </tr>
+        <tr>
+          <td>Matcher worker <em>i</em></td>
+          <td><code class="inline">MatchingEngine</code> for symbol <em>i</em></td>
+          <td>Consumes ingress; produces into events[<em>i</em>]</td>
+        </tr>
+        <tr>
+          <td>Publisher</td>
+          <td><code class="inline">EventLog</code>, latency aggregators</td>
+          <td>Drains all event queues; never touches books</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>Shard (multi_symbol_pipeline.hpp)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">struct Shard {
+  SpscQueue&lt;GatewayOrder, kIngressQueueCapacity&gt; ingress;
+  SpscQueue&lt;PublishEvent, kEventQueueCapacity&gt;   events;
+  lob::MatchingEngine                            engine;
+};</code></pre>
+      </div>
+      <ul>
+        <li>v1 is 1:1 <code class="inline">symbol_id → shard index</code> (no hash collision story yet).</li>
+        <li>Unknown <code class="inline">symbol_id ≥ num_symbols</code> is counted and discarded before enqueue.</li>
+        <li>Matchers are spawned as joinable threads behind <code class="inline">ThreadGuard</code>; no <code class="inline">detach()</code>.</li>
+      </ul>
+      <div class="card">
+        <span class="card-label">Where in this codebase</span>
+        <p><code class="inline">MultiSymbolPipeline::run</code> in <code class="inline">include/multi_symbol_pipeline.hpp</code> routes, enqueues, and joins. The consumer loop lives in <code class="inline">run_matcher_worker</code> (<code class="inline">include/matcher_worker.hpp</code>). Draining is <code class="inline">run_publisher_multi</code> in <code class="inline">include/publisher.hpp</code>.</p>
+      </div>
+    </section>
+
+    <section id="book">
+      <div class="section-head"><span class="idx">03</span><h2>Why the book stays single-threaded</h2></div>
+      <p>The LOB assumes sequential <code class="inline">submit</code>: price-time priority, resting orders, and event sequences are defined for one mutator. Spreading one book across threads would require either a global lock on every submit (serializing the interesting work) or a much harder concurrent book protocol.</p>
+      <p>Sharding sidesteps that: concurrency is <em>across</em> symbols. Inside a shard, matching is ordinary single-threaded C++.</p>
+      <table>
+        <tr><th>Approach</th><th>Correctness cost</th><th>v1?</th></tr>
+        <tr>
+          <td>One owner thread per book</td>
+          <td>Structural — no cross-thread LOB races</td>
+          <td><strong>Yes</strong></td>
+        </tr>
+        <tr>
+          <td>Mutex around a shared global book</td>
+          <td>Correct but serializes all symbols</td>
+          <td>Rejected</td>
+        </tr>
+        <tr>
+          <td>Thread-pool stealing across books</td>
+          <td>Easy to break FIFO / affinity expectations</td>
+          <td>Rejected</td>
+        </tr>
+        <tr>
+          <td><code class="inline">shared_mutex</code> around <code class="inline">submit</code></td>
+          <td>Implies shared mutable book; sharding abandoned</td>
+          <td>Not needed</td>
+        </tr>
+      </table>
+      <div class="card warn">
+        <span class="card-label">Invariant</span>
+        <p>Matcher <em>i</em> is the <strong>only</strong> thread that may call <code class="inline">engines[i].submit</code>. The queue mutex protects ring indices — never the LOB. Pop under lock (or after <code class="inline">pop_wait</code> returns), unlock, then match.</p>
+      </div>
+    </section>
+
+    <section id="spsc">
+      <div class="section-head"><span class="idx">04</span><h2>SPSC topology (not a free-for-all queue)</h2></div>
+      <p><strong>Single-Producer / Single-Consumer</strong>: exactly one thread may call push-family methods; exactly one other thread may call pop-family methods. The type does not enforce that at compile time — the architecture does.</p>
+      <table>
+        <tr><th>Pattern</th><th>Producers</th><th>Consumers</th><th>Use here</th></tr>
+        <tr><td>SPSC</td><td>1</td><td>1</td><td>Gateway → matcher ingress; matcher → per-shard events</td></tr>
+        <tr><td>MPSC</td><td>N</td><td>1</td><td>Not used in v1 (would need if many ingress threads shared one queue)</td></tr>
+        <tr><td>SPMC</td><td>1</td><td>N</td><td>Not needed</td></tr>
+      </table>
+      <p><strong>Why per-shard event queues?</strong> If every matcher pushed into one shared outbound queue, that queue would be MPSC — multiple producers, one publisher. Keeping <code class="inline">events[i]</code> private to matcher <em>i</em> preserves the SPSC contract on both hops. The publisher fans in by polling each queue.</p>
+      <div class="card">
+        <span class="card-label">Publisher wake</span>
+        <p>One publisher must sleep until <em>any</em> shard has work, or until all matchers have finished. That bell is <code class="inline">EventWake</code> in <code class="inline">include/event_wake.hpp</code>: matchers call <code class="inline">notify()</code> after pushes (and on exit); the publisher <code class="inline">wait</code>s on a predicate over <code class="inline">matchers_left</code> and pending events.</p>
+      </div>
+      <div class="code-wrap">
+        <div class="code-bar"><span>roles on each hop</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-text">ingress[i]:  gateway  (producer)  →  matcher i (consumer)   — SPSC
+events[i]:   matcher i (producer) →  publisher (consumer)   — SPSC
+EventWake:   matchers notify      →  publisher waits        — shared CV</code></pre>
+      </div>
+      <p class="dim">Bounded rings live in <code class="inline">include/spsc_queue.hpp</code>. Capacities are compile-time constants (<code class="inline">kIngressQueueCapacity</code> / <code class="inline">kEventQueueCapacity</code> in <code class="inline">matcher_worker.hpp</code>).</p>
+    </section>
+
+    <section id="api">
+      <div class="section-head"><span class="idx">05</span><h2>Bounded queue API</h2></div>
+      <p>A <strong>bounded</strong> queue has a fixed slot count. When full, push must fail, block, or drop — you pick a policy. Unbounded growth under burst load hides overload and can OOM a demo.</p>
+      <p>v1 storage is <code class="inline">std::array&lt;T, N&gt;</code> as a circular buffer (head / tail / size), synchronized with <code class="inline">std::mutex</code> + two condition variables. Correct and testable first; lock-free later if needed behind the same method names.</p>
+      <table>
+        <tr><th>Method</th><th>Behavior</th><th>Typical caller</th></tr>
+        <tr>
+          <td><code class="inline">try_push(T&amp;&amp;)</code></td>
+          <td>If room: move in, notify; return true. If full: leave item, return false.</td>
+          <td>Gateway ingress; matcher → events (drop+count)</td>
+        </tr>
+        <tr>
+          <td><code class="inline">push_wait(T&amp;&amp;, stop)</code></td>
+          <td>Block until space or <code class="inline">stop</code>; return false if stopped while full.</td>
+          <td>Optional blocking / teaching mode</td>
+        </tr>
+        <tr>
+          <td><code class="inline">try_pop(T&amp;)</code></td>
+          <td>If non-empty: move out; return true. Else false.</td>
+          <td>Publisher drain loops</td>
+        </tr>
+        <tr>
+          <td><code class="inline">pop_wait(T&amp;, stop)</code></td>
+          <td>Block until item or <code class="inline">stop</code>; return false on shutdown with empty queue.</td>
+          <td>Matcher idle wait</td>
+        </tr>
+        <tr>
+          <td><code class="inline">wake_all()</code></td>
+          <td>Notify both CVs so blocked waiters can exit.</td>
+          <td>Shutdown after flipping stop flags</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>try_push / pop_wait (spsc_queue.hpp)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">bool try_push(T&amp;&amp; item) {
+  {
+    std::lock_guard&lt;std::mutex&gt; lock(mu_);
+    if (size_ == N) return false;
+    buf_[tail_] = std::move(item);
+    tail_ = next(tail_);
+    ++size_;
+  }  // unlock before notify
+  cv_not_empty_.notify_one();
+  return true;
+}
+
+template &lt;typename StopPred&gt;
+bool pop_wait(T&amp; out, StopPred&amp;&amp; stop) {
+  std::unique_lock&lt;std::mutex&gt; lock(mu_);
+  cv_not_empty_.wait(lock, [&amp;] {
+    return size_ &gt; 0 || stop();
+  });
+  if (size_ == 0) return false;  // stopped and drained
+  out = std::move(buf_[head_]);
+  head_ = next(head_);
+  --size_;
+  lock.unlock();
+  cv_not_full_.notify_one();
+  return true;
+}</code></pre>
+      </div>
+      <div class="card">
+        <span class="card-label">Move hand-off</span>
+        <p>Orders cross threads by <strong>move</strong>, not shared ownership. After a successful <code class="inline">try_push(std::move(go))</code>, the producer’s object is moved-from. Never hold a reference into a ring slot across threads — always move out into a local <code class="inline">T</code>.</p>
+      </div>
+      <p class="dim">Why not bare <code class="inline">std::queue</code>? It is not thread-safe, unbounded by default, and scatters lock/CV policy across call sites. <code class="inline">SpscQueue&lt;T, N&gt;</code> owns the ring, the mutex, and the wake protocol in one place.</p>
+    </section>
+
+    <section id="sync">
+      <div class="section-head"><span class="idx">06</span><h2>Mutex, <code class="inline">unique_lock</code>, CV, spurious wakeups</h2></div>
+      <p>The queue’s critical section is only “touch ring indices / size / slot.” Prefer RAII locks so exceptions and early returns unlock safely.</p>
+      <table>
+        <tr><th>Type</th><th>Use when</th></tr>
+        <tr>
+          <td><code class="inline">std::lock_guard&lt;std::mutex&gt;</code></td>
+          <td>Simple scope lock; no mid-function wait (<code class="inline">try_push</code> / <code class="inline">try_pop</code>).</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::unique_lock&lt;std::mutex&gt;</code></td>
+          <td>Required by <code class="inline">condition_variable::wait</code>; can unlock before notify.</td>
+        </tr>
+      </table>
+      <p><code class="inline">std::condition_variable</code> lets a thread sleep until another signals that shared state may have changed. Always pair with the mutex that protects that state.</p>
+      <ul>
+        <li><code class="inline">wait(lock, pred)</code> — atomically unlock + sleep; on wake, re-lock and re-check <code class="inline">pred</code>.</li>
+        <li><code class="inline">notify_one()</code> — enough for a true SPSC waiter.</li>
+        <li><code class="inline">notify_all()</code> — shutdown / shared wake paths (<code class="inline">wake_all</code>, <code class="inline">EventWake</code>).</li>
+      </ul>
+      <div class="code-wrap">
+        <div class="code-bar"><span>predicate wait (mandatory)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">// NEVER: cv.wait(lock); if (empty()) ...   // race + spurious wake
+// ALWAYS: wait until the predicate is true
+cv_not_empty_.wait(lock, [&amp;] {
+  return size_ &gt; 0 || stop();
+});
+
+// Equivalent manual form:
+while (size_ == 0 &amp;&amp; !stop()) {
+  cv_not_empty_.wait(lock);
+}</code></pre>
+      </div>
+      <p><strong>Spurious wakeups</strong> are allowed by the standard: a thread may leave <code class="inline">wait</code> without a matching notify. The predicate (or while-loop) is mandatory, not pedantry. The same pattern appears in <code class="inline">EventWake::wait</code> — the publisher re-checks “any pending events or all matchers done.”</p>
+      <div class="card warn">
+        <span class="card-label">Lost wake vs predicate</span>
+        <p>If the producer fills a slot and notifies before the consumer starts waiting, a bare <code class="inline">wait</code> can hang forever. Predicate wait returns immediately when <code class="inline">size_ &gt; 0</code> already holds. Update protected state under the lock, then notify.</p>
+      </div>
+    </section>
+
+    <section id="atomics">
+      <div class="section-head"><span class="idx">07</span><h2>Atomics for flags and counters</h2></div>
+      <p>Use atomics for <strong>cross-thread scalars</strong> that are not part of the mutex-protected ring: stop flags, live worker counts, drop counters. Do not mix atomics and mutex casually on the same ring fields — v1 keeps head/tail/size as plain integers under the lock.</p>
+      <table>
+        <tr><th>Use</th><th>Type</th><th>Where</th><th>Typical order</th></tr>
+        <tr>
+          <td>Ingress finished</td>
+          <td><code class="inline">std::atomic&lt;bool&gt; ingress_done_</code></td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code></td>
+          <td>store release; load acquire in matcher stop predicate</td>
+        </tr>
+        <tr>
+          <td>Matchers still alive</td>
+          <td><code class="inline">std::atomic&lt;int&gt; matchers_left_</code></td>
+          <td>pipeline + publisher</td>
+          <td>acq_rel decrement; acquire in publisher exit check</td>
+        </tr>
+        <tr>
+          <td>Drop / reject counts</td>
+          <td><code class="inline">std::atomic&lt;uint64_t&gt;</code></td>
+          <td>ingress / events / unknown symbol</td>
+          <td><code class="inline">relaxed</code> increments for stats</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>practical memory orders</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">// after enqueuing the batch:
+ingress_done_.store(true, std::memory_order_release);
+for (auto&amp; shard : shards_) shard-&gt;ingress.wake_all();
+wake_.notify();
+
+// matcher stop predicate (matcher_worker.hpp):
+auto stop = [&amp;] {
+  return ingress_done.load(std::memory_order_acquire);
+};
+
+// full queue at gateway:
+ingress_drops_.fetch_add(1, std::memory_order_relaxed);</code></pre>
+      </div>
+      <p class="dim"><strong>Practical guidance:</strong> <code class="inline">relaxed</code> for independent counters; acquire/release when a flag write must become visible before another thread acts on “we’re stopping.” Default <code class="inline">seq_cst</code> is safe if you are unsure — correctness over cleverness.</p>
+    </section>
+
+    <section id="backpressure">
+      <div class="section-head"><span class="idx">08</span><h2>Backpressure: drop+count vs block</h2></div>
+      <p>Bounded SPSC means the producer will eventually hit capacity. <strong>Backpressure</strong> is the explicit choice when that happens — instead of unbounded RAM growth. CLI / file ingress has no socket to disconnect, so v1 chooses between block and drop+count.</p>
+      <table>
+        <tr><th>Stage</th><th>Producer</th><th>Consumer</th><th>Pressure signal</th></tr>
+        <tr>
+          <td>Ingress</td>
+          <td>Gateway</td>
+          <td>Matcher worker</td>
+          <td>Shard ingress SPSC full</td>
+        </tr>
+        <tr>
+          <td>Events</td>
+          <td>Matcher worker</td>
+          <td>Publisher</td>
+          <td>Per-shard event SPSC full</td>
+        </tr>
+      </table>
+      <table>
+        <tr><th>Policy</th><th>Behaviour</th><th>v1 default?</th><th>Trade-off</th></tr>
+        <tr>
+          <td><strong>Drop + count</strong></td>
+          <td><code class="inline">try_push</code> fails → discard, bump atomic</td>
+          <td><strong>Yes</strong></td>
+          <td>Keeps the producer responsive; loses work; overload is visible</td>
+        </tr>
+        <tr>
+          <td><strong>Block</strong></td>
+          <td><code class="inline">push_wait</code> until space (or stop)</td>
+          <td>Optional / teaching</td>
+          <td>Preserves every item; can stall the whole pipeline; hides overload as “slowness”</td>
+        </tr>
+        <tr>
+          <td><strong>Disconnect</strong></td>
+          <td>Close client / reject session</td>
+          <td>N/A (no TCP)</td>
+          <td>Natural for sockets; revisit if TCP ingress lands</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>ingress drop (multi_symbol_pipeline.hpp)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">if (!shard.ingress.try_push(std::move(go))) {
+  ingress_drops_.fetch_add(1, std::memory_order_relaxed);
+}</code></pre>
+      </div>
+      <div class="code-wrap">
+        <div class="code-bar"><span>event-path drop (matcher_worker.hpp)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">if (!events.try_push(std::move(pe))) {
+  event_drops.fetch_add(1, std::memory_order_relaxed);
+}
+if (wake != nullptr) wake-&gt;notify();</code></pre>
+      </div>
+      <div class="card warn">
+        <span class="card-label">Symmetric fuse</span>
+        <p>Capacity on ingress without capacity on events just moves the hang one hop later. Prefer the same policy family on both hops. If the event queue is full and the matcher <em>blocks</em>, it stops popping ingress → ingress fills → the gateway feels pressure that looks like “matching is slow.”</p>
+      </div>
+      <ul>
+        <li>A dropped ingress order never reaches the LOB — no partial book mutation.</li>
+        <li>A dropped publish event means the book already mutated; the audit trail is incomplete — still count it.</li>
+        <li>Do not format logs on the failed <code class="inline">try_push</code> hot path beyond the atomic bump.</li>
+      </ul>
+    </section>
+
+    <section id="shutdown">
+      <div class="section-head"><span class="idx">09</span><h2>Shutdown order</h2></div>
+      <p>Wrong join order hangs or loses wakes. The multi-symbol batch path documents a fixed sequence:</p>
+      <ol class="plain">
+        <li>Enqueue the whole batch (gateway / main thread as sole ingress producer).</li>
+        <li>Store <code class="inline">ingress_done_ = true</code> (release), then <code class="inline">wake_all()</code> on every ingress queue.</li>
+        <li>Notify <code class="inline">EventWake</code> so the publisher is not stuck if matchers exit quickly.</li>
+        <li>Each matcher drains remaining ingress via <code class="inline">pop_wait</code>, pushes leftover events, decrements <code class="inline">matchers_left_</code>, notifies wake, and <code class="inline">events.wake_all()</code>.</li>
+        <li>Publisher drains all event queues until <code class="inline">matchers_left_ == 0</code>, then final-drains and exits.</li>
+        <li>Join matchers, then join publisher (<code class="inline">ThreadGuard</code>).</li>
+      </ol>
+      <div class="code-wrap">
+        <div class="code-bar"><span>stop producing → wake → join (pipeline)</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">ingress_done_.store(true, std::memory_order_release);
+for (auto&amp; shard : shards_) {
+  shard-&gt;ingress.wake_all();
+}
+wake_.notify();
+
+for (auto&amp; m : matchers) m-&gt;join();
+publisher.join();</code></pre>
+      </div>
+      <div class="card warn">
+        <span class="card-label">Order of stop</span>
+        <p>Stop producing first, then wake and join matchers, then join the publisher after event queues drain. Joining the publisher while matchers still push — or flipping <code class="inline">ingress_done_</code> without <code class="inline">wake_all</code> — leaves a worker blocked in <code class="inline">pop_wait</code> forever.</p>
+      </div>
+      <table>
+        <tr><th>Bug</th><th>How it shows up</th><th>Fix</th></tr>
+        <tr>
+          <td>Shutdown hang</td>
+          <td>Flag false but no notify; worker blocked in <code class="inline">wait</code></td>
+          <td>Notify all relevant CVs after flipping the flag</td>
+        </tr>
+        <tr>
+          <td>Join while still producing</td>
+          <td>Publisher joined before matchers finish pushing</td>
+          <td>Matchers first (or wait on <code class="inline">matchers_left_</code>), then publisher</td>
+        </tr>
+        <tr>
+          <td>Lock-order deadlock</td>
+          <td>Nested locks across queues / stats</td>
+          <td>One mutex per queue; atomics for counters; no nested queue locks</td>
+        </tr>
+      </table>
+    </section>
+
+    <section id="pitfalls">
+      <div class="section-head"><span class="idx">10</span><h2>Pitfalls &amp; decisions</h2></div>
+
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Sharing a MatchingEngine across threads</h4>
+          <p>Undefines LOB correctness. Shard ownership is the safety net — do not “just add a mutex around submit” as the design.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Two producers on one “SPSC”</h4>
+          <p>If two threads push the same queue, the SPSC contract is broken. Serialize ingress on one thread or design MPSC deliberately.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Waiting without a predicate</h4>
+          <p>Spurious wakeups and notify-before-wait both break bare <code class="inline">wait</code>. Always re-check empty / full / stop flags.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Busy-spin on <code class="inline">try_pop</code> forever</h4>
+          <p>Burns a core. Matchers use <code class="inline">pop_wait</code>; the publisher sleeps on <code class="inline">EventWake</code> when idle.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Silent drop with no counter</h4>
+          <p>Looks like a matching bug (“where did my fills go?”). Always expose ingress and event drop counts.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Holding the queue mutex across matching</h4>
+          <p>Pop, unlock, then <code class="inline">submit</code>. Holding the ring lock across LOB work stalls the gateway for no benefit.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <span class="card-label">Decision · ownership</span>
+        <p><strong>Shard-by-symbol + one matcher thread per book + dedicated publisher.</strong> Rejected: thread-pool stealing across books; one mutex-protected global book; <code class="inline">shared_mutex</code> around <code class="inline">submit</code>.</p>
+      </div>
+      <div class="card">
+        <span class="card-label">Decision · queues</span>
+        <p><strong>Mutex-backed bounded <code class="inline">SpscQueue&lt;T, N&gt;</code></strong> with <code class="inline">try_push</code> / <code class="inline">pop_wait</code> / <code class="inline">wake_all</code>. Per-shard event queues keep both hops SPSC; <code class="inline">EventWake</code> fans the publisher in. Rejected: lock-free ring in v1; unbounded <code class="inline">std::queue</code> + scattered locks; single shared MPSC outbound queue.</p>
+      </div>
+      <div class="card">
+        <span class="card-label">Decision · sync &amp; pressure</span>
+        <p><strong>Per-queue mutex + CV; atomics for <code class="inline">ingress_done_</code>, <code class="inline">matchers_left_</code>, and drop counters.</strong> Default full-queue policy: <code class="inline">try_push</code> + drop + count on ingress and events. Optional <code class="inline">push_wait</code> for demos. Rejected as default: always-block (hides overload); busy-spin idle.</p>
+      </div>
+    </section>
+
+    <footer>
+      <a href="index.html">← Theory index</a> · <a href="../PLAN.md">PLAN.md</a>
+    </footer>
+  </main>
+</div>
+<script src="theory.js"></script>
+</body>
+</html>

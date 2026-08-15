@@ -1,0 +1,11 @@
+# Multi-symbol demo.
+# Symbols 0 and 1 match in parallel on separate worker threads.
+#
+# sym0: buy rests, sell crosses → TRADE
+# sym1: buy rests, sell crosses → TRADE
+
+NEW 1 BUY  LIMIT 10 100 SYM 0
+NEW 2 SELL LIMIT 10 100 SYM 0
+
+NEW 1 BUY  LIMIT 5  50  SYM 1
+NEW 2 SELL LIMIT 5  50  SYM 1

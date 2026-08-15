@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Testing &amp; Correctness — Knowledge Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <a class="back" href="index.html">← Theory index</a>
+    <span class="toc-label">Contents</span>
+    <ol id="toc-list">
+      <li><a href="#split"><span class="num">01</span>Two layers</a></li>
+      <li><a href="#binaries"><span class="num">02</span>Test binaries</a></li>
+      <li><a href="#golden"><span class="num">03</span>LOB golden</a></li>
+      <li><a href="#pipeline"><span class="num">04</span>Pipeline tests</a></li>
+      <li><a href="#invariants"><span class="num">05</span>Invariants</a></li>
+      <li><a href="#determinism"><span class="num">06</span>Determinism limits</a></li>
+      <li><a href="#tsan"><span class="num">07</span>TSan (optional)</a></li>
+      <li><a href="#decision"><span class="num">08</span>Decision</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">Testing <span class="brace">{</span> Correctness under load <span class="brace">}</span></h1>
+      <p class="subtitle">Prove matching single-threaded. Prove plumbing with pipeline smokes that assert fills, isolation, and latency samples — not bit-identical multi-shard event logs.</p>
+    </header>
+
+    <section id="split">
+      <div class="section-head"><span class="idx">01</span><h2>Two layers</h2></div>
+      <table>
+        <tr><th>Layer</th><th>Threads</th><th>Asserts</th><th>Role</th></tr>
+        <tr>
+          <td><strong>LOB golden</strong></td>
+          <td>1</td>
+          <td>G1–G9 style book / event checks</td>
+          <td>Vendored matcher still correct</td>
+        </tr>
+        <tr>
+          <td><strong>Pipeline / concurrency</strong></td>
+          <td>N</td>
+          <td>Fills, isolation, drops, latency counts, clean join</td>
+          <td>Queues + threads + publisher work</td>
+        </tr>
+      </table>
+      <div class="card">
+        <span class="card-label">Why split</span>
+        <p>Scheduler interleaving changes the order events hit the publisher across symbols. Golden-diffing that log across runs is flaky. Keep LOB proofs off the queues.</p>
+      </div>
+    </section>
+
+    <section id="binaries">
+      <div class="section-head"><span class="idx">02</span><h2>Shipped test binaries</h2></div>
+      <table>
+        <tr><th>Target</th><th>Source</th><th>What it covers</th></tr>
+        <tr>
+          <td><code class="inline">lob_tests</code></td>
+          <td><code class="inline">tests/test_lob_golden.cpp</code></td>
+          <td>Direct <code class="inline">MatchingEngine::submit</code> / cancel — no gateway threads</td>
+        </tr>
+        <tr>
+          <td><code class="inline">gateway_tests</code></td>
+          <td><code class="inline">tests/test_spsc_queue.cpp</code></td>
+          <td>SPSC FIFO, full-queue <code class="inline">try_push</code>, two-thread transfer, <code class="inline">GatewayOrder</code></td>
+        </tr>
+        <tr>
+          <td><code class="inline">e2e_tests</code></td>
+          <td><code class="inline">tests/test_one_symbol_e2e.cpp</code></td>
+          <td><code class="inline">OneSymbolPipeline</code>: exact fill + partial residual</td>
+        </tr>
+        <tr>
+          <td><code class="inline">multi_tests</code></td>
+          <td><code class="inline">tests/test_multi_symbol.cpp</code></td>
+          <td>Parallel fills on sym 0/1; book isolation; unknown-symbol drop</td>
+        </tr>
+        <tr>
+          <td><code class="inline">latency_tests</code></td>
+          <td><code class="inline">tests/test_latency.cpp</code></td>
+          <td><code class="inline">LatencyStats</code> unit + pipeline sample counts / report labels</td>
+        </tr>
+      </table>
+      <p class="dim">Run all: <code class="inline">ctest --test-dir build</code>. Hand-rolled <code class="inline">expect()</code> — no Catch2/GTest.</p>
+    </section>
+
+    <section id="golden">
+      <div class="section-head"><span class="idx">03</span><h2>LOB golden (single-thread)</h2></div>
+      <p><code class="inline">test_lob_golden.cpp</code> calls the vendored engine directly. Event lines stay timestamp-free. Failures print <code class="inline">FAIL:</code> and bump a failure count.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>tests/test_lob_golden.cpp</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">lob::MatchingEngine engine;
+engine.submit({1, Side::Buy, OrderType::Limit, 100, 10});
+// … assert bids / trades / cancels — no SPSC, no threads</code></pre>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <div class="section-head"><span class="idx">04</span><h2>Pipeline tests (what they actually assert)</h2></div>
+      <table>
+        <tr><th>Test</th><th>Oracle</th></tr>
+        <tr>
+          <td>E2E exact fill</td>
+          <td>Log contains ACCEPT + <code class="inline">TRADE maker=1 taker=2</code>; book empty; zero drops</td>
+        </tr>
+        <tr>
+          <td>E2E partial</td>
+          <td>Trade qty=4; residual bid qty=6</td>
+        </tr>
+        <tr>
+          <td>Multi parallel fills</td>
+          <td>Trades on <code class="inline">sym=0</code> and <code class="inline">sym=1</code>; both books empty</td>
+        </tr>
+        <tr>
+          <td>Books isolated</td>
+          <td>Bid on 0 + ask on 1 → <strong>no</strong> TRADE across symbols</td>
+        </tr>
+        <tr>
+          <td>Unknown symbol</td>
+          <td><code class="inline">unknown_symbol_drops == 1</code>; empty log</td>
+        </tr>
+        <tr>
+          <td>Latency</td>
+          <td><code class="inline">queue_wait</code> / <code class="inline">match_duration</code> counts ≥ orders; publish samples &gt; 0</td>
+        </tr>
+      </table>
+      <div class="card warn">
+        <span class="card-label">Not asserted</span>
+        <p>Global interleaving order of <code class="inline">sym=0</code> vs <code class="inline">sym=1</code> lines across runs. Prefer substring / per-symbol checks (as <code class="inline">multi_tests</code> does).</p>
+      </div>
+    </section>
+
+    <section id="invariants">
+      <div class="section-head"><span class="idx">05</span><h2>Invariants under concurrency</h2></div>
+      <ol class="plain">
+        <li><strong>No cross-shard book touch</strong> — enforced by construction (<code class="inline">Shard</code> owns its engine).</li>
+        <li><strong>Joins on shutdown</strong> — <code class="inline">ThreadGuard</code>; no <code class="inline">detach</code>.</li>
+        <li><strong>No hang</strong> — <code class="inline">ingress_done</code> + <code class="inline">wake_all</code> + <code class="inline">matchers_left</code> + <code class="inline">EventWake</code>.</li>
+        <li><strong>Move hand-off</strong> — after <code class="inline">try_push(std::move(…))</code>, producer does not reuse the object.</li>
+        <li><strong>Drop accounting</strong> — ingress / event / unknown-symbol counters on the pipeline.</li>
+      </ol>
+    </section>
+
+    <section id="determinism">
+      <div class="section-head"><span class="idx">06</span><h2>Determinism limits</h2></div>
+      <table>
+        <tr><th>Usually stable</th><th>Usually not</th></tr>
+        <tr>
+          <td>Per-symbol fills given no drops</td>
+          <td>Interleaving of shard lines in the publisher log</td>
+        </tr>
+        <tr>
+          <td>Final book under quiescence after join</td>
+          <td>Exact p50/p99 values</td>
+        </tr>
+        <tr>
+          <td>Drop counters for intentional unknown symbol</td>
+          <td>Which order dropped under racing full queues</td>
+        </tr>
+      </table>
+      <p>Size fill tests so queues do not drop; use a separate case for counter-only overload if needed.</p>
+    </section>
+
+    <section id="tsan">
+      <div class="section-head"><span class="idx">07</span><h2>ThreadSanitizer (optional)</h2></div>
+      <p>Not wired in default CMake. Locally you can rebuild a test target with <code class="inline">-fsanitize=thread</code> and run <code class="inline">multi_tests</code> / <code class="inline">e2e_tests</code>. Useful for accidental shared-book bugs; slows runs.</p>
+    </section>
+
+    <section id="decision">
+      <div class="section-head"><span class="idx">08</span><h2>Decision</h2></div>
+      <div class="card">
+        <span class="card-label">Decision</span>
+        <p><strong>Five hand-rolled binaries:</strong> LOB goldens, SPSC unit, one-symbol E2E, multi-symbol smoke, latency. Aggregate / substring oracles for concurrent runs. Rejected: requiring bit-stable multi-shard publisher logs as the primary test.</p>
+      </div>
+      <p class="dim">Related: <a href="Theory_Concurrency.html">Concurrency</a> · <a href="Theory_Latency_And_Clocks.html">Latency</a> · <a href="../PLAN.md">PLAN.md</a>.</p>
+    </section>
+
+    <footer>
+      <a href="index.html">← Theory index</a> · <a href="../PLAN.md">PLAN.md</a>
+    </footer>
+  </main>
+</div>
+<script src="theory.js"></script>
+</body>
+</html>

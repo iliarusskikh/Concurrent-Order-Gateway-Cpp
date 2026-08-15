@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C++ Code Reference — Project Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <a class="back" href="index.html">← Theory index</a>
+    <span class="toc-label">Contents</span>
+    <ol id="toc-list">
+      <li><a href="#dialect"><span class="num">01</span>Dialect &amp; scope</a></li>
+      <li><a href="#feature-map"><span class="num">02</span>Feature → module map</a></li>
+      <li><a href="#headers"><span class="num">03</span>Headers checklist</a></li>
+      <li><a href="#threads"><span class="num">04</span>Threads &amp; sync</a></li>
+      <li><a href="#move"><span class="num">05</span>Move, unique_ptr, RAII</a></li>
+      <li><a href="#templates"><span class="num">06</span>Templates &amp; lambdas</a></li>
+      <li><a href="#chrono"><span class="num">07</span>chrono &amp; optional</a></li>
+      <li><a href="#keywords"><span class="num">08</span>Keyword index</a></li>
+      <li><a href="#unused"><span class="num">09</span>Deliberately unused</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">C++ <span class="brace">{</span> Code reference <span class="brace">}</span></h1>
+      <p class="subtitle">Language features used in this tree — threads, mutex/CV, atomics, moves, templates, chrono — mapped to real headers under <code class="inline">include/</code>. Companion to the systems notes, not a general C++ tutorial.</p>
+    </header>
+
+    <section id="dialect">
+      <div class="section-head"><span class="idx">01</span><h2>Dialect &amp; scope</h2></div>
+      <table>
+        <tr><th>Item</th><th>In this project</th></tr>
+        <tr><td>Standard</td><td><code class="inline">C++17</code> (<code class="inline">CMakeLists.txt</code>: <code class="inline">CMAKE_CXX_STANDARD 17</code>)</td></tr>
+        <tr><td>Deps</td><td>C++ standard library only for the gateway path; vendored LOB under <code class="inline">include/lob/</code></td></tr>
+        <tr><td>Concurrency</td><td>Real <code class="inline">std::thread</code> workers — unlike MDS (single-threaded poll loops)</td></tr>
+        <tr><td>Networking</td><td>None in v1 — no POSIX sockets headers required</td></tr>
+        <tr><td>Build shape</td><td><code class="inline">gateway</code> + <code class="inline">*_tests</code> binaries; header-only <code class="inline">cog_core</code></td></tr>
+      </table>
+      <div class="card">
+        <span class="card-label">Decision</span>
+        <p><strong>C++17 floor.</strong> Enough for <code class="inline">std::optional</code>, structured bindings, <code class="inline">if constexpr</code> if needed, and the full thread library. Rejected: C++11-only (MDS floor) — this project’s point is modern concurrency vocabulary. Rejected: C++20 as requirement (<code class="inline">jthread</code> nice-to-have; RAII <code class="inline">ThreadGuard</code> covers join).</p>
+      </div>
+    </section>
+
+    <section id="feature-map">
+      <div class="section-head"><span class="idx">02</span><h2>Feature → file map</h2></div>
+      <p>Each feature maps to a concrete file in this repo.</p>
+      <table>
+        <tr><th>Feature</th><th>Home</th><th>How you use it</th></tr>
+        <tr>
+          <td><code class="inline">std::thread</code></td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code>, <code class="inline">thread_guard.hpp</code></td>
+          <td>Spawn matchers + publisher</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::mutex</code></td>
+          <td><code class="inline">spsc_queue.hpp</code>, <code class="inline">event_log.hpp</code>, <code class="inline">latency_stats.hpp</code></td>
+          <td>Queue indices; log/stats under contention</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::condition_variable</code></td>
+          <td><code class="inline">spsc_queue.hpp</code>, <code class="inline">event_wake.hpp</code></td>
+          <td>Block on empty/full; wake publisher across shards</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::unique_lock</code></td>
+          <td><code class="inline">spsc_queue.hpp</code></td>
+          <td>Required partner for CV waits</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::atomic</code></td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code>, matchers</td>
+          <td><code class="inline">ingress_done</code>, <code class="inline">matchers_left</code>, drop counters</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::move</code></td>
+          <td>gateway → ingress → matcher → events</td>
+          <td>Hand off <code class="inline">GatewayOrder</code> / <code class="inline">PublishEvent</code></td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::unique_ptr</code></td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code></td>
+          <td>Non-movable <code class="inline">Shard</code> / <code class="inline">ThreadGuard</code> in vectors</td>
+        </tr>
+        <tr>
+          <td>Class template + NTTP</td>
+          <td><code class="inline">SpscQueue&lt;T, N&gt;</code></td>
+          <td>Bounded capacity at compile time</td>
+        </tr>
+        <tr>
+          <td>Lambda</td>
+          <td>pipeline thread entry, CV stop preds</td>
+          <td>Capture <code class="inline">this</code> / atomics carefully</td>
+        </tr>
+        <tr>
+          <td><code class="inline">steady_clock</code></td>
+          <td><code class="inline">gateway_order.hpp</code>, <code class="inline">matcher_worker.hpp</code>, <code class="inline">latency_stats.hpp</code></td>
+          <td>queue_wait / match_duration / match_to_publish</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>mental model</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-text">thread / ThreadGuard     → lifecycle
+mutex + unique_lock + cv → SpscQueue wait/notify
+atomic                   → ingress_done, matchers_left, drops
+move / unique_ptr        → order ownership across hops
+template &lt;T, N&gt;          → queue type
+lambda                   → thread bodies
+chrono                   → latency_stats.hpp
+optional / enum class    → API clarity at boundaries</code></pre>
+      </div>
+    </section>
+
+    <section id="headers">
+      <div class="section-head"><span class="idx">03</span><h2>Headers checklist</h2></div>
+      <p>Expect these includes on the gateway path (LOB headers separate):</p>
+      <table>
+        <tr><th>Header</th><th>Why</th></tr>
+        <tr><td><code class="inline">&lt;thread&gt;</code></td><td><code class="inline">std::thread</code>, <code class="inline">this_thread::yield</code> / sleep if needed</td></tr>
+        <tr><td><code class="inline">&lt;mutex&gt;</code></td><td><code class="inline">mutex</code>, <code class="inline">lock_guard</code>, <code class="inline">unique_lock</code></td></tr>
+        <tr><td><code class="inline">&lt;condition_variable&gt;</code></td><td>Empty/full waits</td></tr>
+        <tr><td><code class="inline">&lt;atomic&gt;</code></td><td>Flags and counters</td></tr>
+        <tr><td><code class="inline">&lt;chrono&gt;</code></td><td>Clocks, durations, casts</td></tr>
+        <tr><td><code class="inline">&lt;optional&gt;</code></td><td>C++17 parse / try APIs</td></tr>
+        <tr><td><code class="inline">&lt;utility&gt;</code></td><td><code class="inline">std::move</code>, <code class="inline">forward</code> if needed</td></tr>
+        <tr><td><code class="inline">&lt;memory&gt;</code></td><td><code class="inline">unique_ptr</code>, <code class="inline">make_unique</code></td></tr>
+        <tr><td><code class="inline">&lt;vector&gt;</code> / <code class="inline">&lt;array&gt;</code> / <code class="inline">&lt;deque&gt;</code></td><td>Sample stores; queue backing; shard tables</td></tr>
+        <tr><td><code class="inline">&lt;string&gt;</code> / <code class="inline">&lt;string_view&gt;</code></td><td>DSL parsing (view optional C++17)</td></tr>
+        <tr><td><code class="inline">&lt;cstdint&gt;</code></td><td>Fixed-width qty/price/ids aligned with LOB</td></tr>
+        <tr><td><code class="inline">&lt;algorithm&gt;</code></td><td><code class="inline">sort</code> for percentiles</td></tr>
+        <tr><td><code class="inline">&lt;iostream&gt;</code> / <code class="inline">&lt;fstream&gt;</code></td><td>CLI, scenario file, publisher sink</td></tr>
+      </table>
+      <p class="dim">Prefer <code class="inline">#pragma once</code> on project headers (same habit as MDS). Keep queue implementation header-only or a tiny <code class="inline">.cpp</code> — either is fine if include graph stays sane.</p>
+    </section>
+
+    <section id="threads">
+      <div class="section-head"><span class="idx">04</span><h2>Threads &amp; synchronization cheat sheet</h2></div>
+      <h3><code class="inline">std::thread</code></h3>
+      <ul>
+        <li>Joinable until <code class="inline">join</code> or <code class="inline">detach</code> — prefer join + RAII guard.</li>
+        <li>Destructor of a still-joinable thread calls <code class="inline">std::terminate</code> — why <code class="inline">ThreadGuard</code> exists.</li>
+        <li>Pass ids/indices by value into the thread body; do not capture loop variables by reference without care.</li>
+      </ul>
+      <div class="code-wrap">
+        <div class="code-bar"><span>spawn pattern</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">std::vector&lt;std::thread&gt; workers;
+for (int i = 0; i &lt; n; ++i) {
+    workers.emplace_back([i, &amp;shards, &amp;running] {
+        matcher_loop(shards[i], running);
+    });
+}
+// ThreadGuard or explicit join loop at shutdown</code></pre>
+      </div>
+
+      <h3>Mutex, unique_lock, condition_variable</h3>
+      <ul>
+        <li><code class="inline">lock_guard</code> — scope lock, no CV.</li>
+        <li><code class="inline">unique_lock</code> — unlockable; required for <code class="inline">cv.wait</code>.</li>
+        <li>Always wait with a predicate: <code class="inline">cv.wait(lk, [&amp;]{ return !empty || !running; });</code> — spurious wakeups are real.</li>
+        <li><code class="inline">notify_one</code> for SPSC is enough; <code class="inline">notify_all</code> on shutdown.</li>
+      </ul>
+
+      <h3>Atomics &amp; memory order</h3>
+      <table>
+        <tr><th>Use</th><th>Typical order</th><th>Notes</th></tr>
+        <tr>
+          <td>Drop counters</td>
+          <td><code class="inline">relaxed</code></td>
+          <td>No synchronization story beyond the count</td>
+        </tr>
+        <tr>
+          <td><code class="inline">running</code> flag</td>
+          <td><code class="inline">acquire</code>/<code class="inline">release</code> or seq_cst default</td>
+          <td>Store release on stop; load acquire in loops — or just seq_cst for clarity in v1</td>
+        </tr>
+        <tr>
+          <td>Queue data</td>
+          <td>Mutex, not atomics</td>
+          <td>Do not “atomically” share the book</td>
+        </tr>
+      </table>
+      <div class="card warn">
+        <span class="card-label">v1 simplicity</span>
+        <p>Default sequential consistency on atomics is fine for flags until you have a measured reason to weaken. Prefer correct + clear.</p>
+      </div>
+    </section>
+
+    <section id="move">
+      <div class="section-head"><span class="idx">05</span><h2>Move, unique_ptr, RAII</h2></div>
+      <table>
+        <tr><th>Tool</th><th>Role in gateway</th></tr>
+        <tr>
+          <td><code class="inline">std::move</code></td>
+          <td>Enqueue/dequeue orders without copies; transfer into LOB submit</td>
+        </tr>
+        <tr>
+          <td>Move-only types / <code class="inline">= delete</code> copy</td>
+          <td>Optional on <code class="inline">Order</code> wrappers if you want the compiler to catch accidental copies</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::unique_ptr&lt;T&gt;</code></td>
+          <td>Exclusive heap ownership when an order/event must outlive a stack frame — hand off, do not share</td>
+        </tr>
+        <tr>
+          <td><code class="inline">ThreadGuard</code></td>
+          <td>Join in destructor (Rule of Five/Zero around the thread handle)</td>
+        </tr>
+        <tr>
+          <td><code class="inline">noexcept</code> moves</td>
+          <td>Helpful for containers; prefer on queue element moves</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>hand-off, not share</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">// producer
+q.try_push(std::move(order));   // order is moved-from
+
+// consumer
+Order o;
+if (q.pop(o)) {
+    engine.submit(std::move(o));
+}</code></pre>
+      </div>
+      <p class="dim">Deep dive: <a href="Theory_Ownership_And_Language.html">Ownership &amp; language</a>.</p>
+    </section>
+
+    <section id="templates">
+      <div class="section-head"><span class="idx">06</span><h2>Templates &amp; lambdas</h2></div>
+      <h3>Queue template</h3>
+      <div class="code-wrap">
+        <div class="code-bar"><span>API shape</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">template &lt;typename T, std::size_t N&gt;
+class SpscQueue {
+public:
+    bool try_push(T&amp;&amp; item);
+    void push(T&amp;&amp; item);          // may block
+    bool try_pop(T&amp; out);
+    bool pop(T&amp; out);             // may block until item or shutdown
+    // …
+};</code></pre>
+      </div>
+      <p>Non-type template parameter <code class="inline">N</code> freezes capacity. Alternative: runtime capacity in the ctor — pick one and document it.</p>
+
+      <h3>Lambdas as thread entry</h3>
+      <ul>
+        <li><code class="inline">[&amp;]</code> — easy and dangerous if the lambda outlives locals; prefer capturing what you need.</li>
+        <li><code class="inline">[=]</code> — copies; fine for small ids; will not see later flag updates unless atomic/shared.</li>
+        <li>Do not capture <code class="inline">this</code> carelessly if the object dies before join.</li>
+      </ul>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Capturing the loop variable by reference</h4>
+          <p><code class="inline">for (int i=0; …) threads.emplace_back([&amp;]{ use(i); })</code> — all threads may see the final <code class="inline">i</code>. Capture <code class="inline">i</code> by value: <code class="inline">[i, &amp;shards]</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="chrono">
+      <div class="section-head"><span class="idx">07</span><h2>chrono, optional, enum class</h2></div>
+      <h3>chrono</h3>
+      <ul>
+        <li><code class="inline">using clock = std::chrono::steady_clock;</code></li>
+        <li><code class="inline">clock::now()</code>, <code class="inline">duration_cast&lt;nanoseconds&gt;</code>, <code class="inline">.count()</code></li>
+        <li>See <a href="Theory_Latency_And_Clocks.html">Latency &amp; Clocks</a> for metric definitions.</li>
+      </ul>
+      <h3><code class="inline">std::optional</code></h3>
+      <div class="code-wrap">
+        <div class="code-bar"><span>optional at boundaries</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">std::optional&lt;Order&gt; parse_line(std::string_view line);
+// …
+if (auto o = parse_line(line)) {
+    route(std::move(*o));
+}</code></pre>
+      </div>
+      <h3><code class="inline">enum class</code></h3>
+      <p>Carry from LOB: side, order type, event kind, reject / cancel reasons. Wire publisher formatting through explicit casts or helpers — never rely on plain enums promoting to <code class="inline">int</code> in logs accidentally.</p>
+    </section>
+
+    <section id="keywords">
+      <div class="section-head"><span class="idx">08</span><h2>Keyword &amp; feature index</h2></div>
+      <p class="dim">Prep checklist — “yes” means expected in v1 gateway code (not only LOB internals).</p>
+      <table>
+        <tr><th>Keyword / feature</th><th>v1?</th><th>Primary home</th></tr>
+        <tr><td><code class="inline">class</code> / <code class="inline">struct</code></td><td>yes</td><td>queue, shards, stats, LOB types</td></tr>
+        <tr><td><code class="inline">enum class</code></td><td>yes</td><td>events, sides, reasons</td></tr>
+        <tr><td><code class="inline">template</code> / NTTP</td><td>yes</td><td><code class="inline">SpscQueue&lt;T,N&gt;</code></td></tr>
+        <tr><td><code class="inline">public</code> / <code class="inline">private</code></td><td>yes</td><td>encapsulation on queue / guards</td></tr>
+        <tr><td><code class="inline">explicit</code></td><td>yes</td><td>guards, wrappers</td></tr>
+        <tr><td><code class="inline">noexcept</code></td><td>yes</td><td>moves, trivial accessors</td></tr>
+        <tr><td><code class="inline">= delete</code> / <code class="inline">= default</code></td><td>yes</td><td>move-only / Rule of Five types</td></tr>
+        <tr><td><code class="inline">constexpr</code></td><td>optional</td><td>capacities, helpers</td></tr>
+        <tr><td><code class="inline">auto</code></td><td>yes</td><td>time points, range-for, lambdas</td></tr>
+        <tr><td><code class="inline">using</code> (alias)</td><td>yes</td><td>clock alias, ns alias</td></tr>
+        <tr><td><code class="inline">namespace</code></td><td>yes</td><td>project / <code class="inline">detail</code></td></tr>
+        <tr><td><code class="inline">nullptr</code></td><td>yes</td><td>throughout</td></tr>
+        <tr><td><code class="inline">static_assert</code></td><td>yes</td><td>capacity &gt; 0; LOB size checks if packed</td></tr>
+        <tr><td><code class="inline">static_cast</code></td><td>yes</td><td>enums, sizes</td></tr>
+        <tr><td>Range-<code class="inline">for</code></td><td>yes</td><td>shards, samples</td></tr>
+        <tr><td>Structured bindings</td><td>optional</td><td>C++17 pair unpack at boundaries</td></tr>
+        <tr><td><code class="inline">if constexpr</code></td><td>optional</td><td>template branches</td></tr>
+        <tr><td><code class="inline">std::optional</code></td><td>yes</td><td>parse / try APIs</td></tr>
+        <tr><td><code class="inline">std::string_view</code></td><td>optional</td><td>DSL lines</td></tr>
+        <tr><td><code class="inline">virtual</code> / inheritance</td><td>no*</td><td>*not required for v1 design</td></tr>
+        <tr><td><code class="inline">try</code> / <code class="inline">catch</code></td><td>narrow</td><td>parse only — not hot-path control flow</td></tr>
+      </table>
+    </section>
+
+    <section id="unused">
+      <div class="section-head"><span class="idx">09</span><h2>Deliberately unused in v1</h2></div>
+      <p>Useful to know what this project is <em>not</em> demonstrating (even if sibling repos do):</p>
+      <ul>
+        <li><code class="inline">std::shared_ptr</code> for live orders across threads — hand-off with move / <code class="inline">unique_ptr</code> instead</li>
+        <li>Lock-free atomic rings, hazard pointers, memory-order olympics on the queue data path</li>
+        <li>Networking: <code class="inline">socket</code>, <code class="inline">poll</code>, <code class="inline">epoll</code>, MDS framing headers</li>
+        <li><code class="inline">std::jthread</code> as a hard requirement (C++20) — optional later; RAII join is enough</li>
+        <li>Thread pools / work stealing across symbols</li>
+        <li>Exceptions for full-queue control flow</li>
+        <li>Boost.Asio, Folly, lock-free third-party queues</li>
+      </ul>
+      <div class="card">
+        <span class="card-label">Study order</span>
+        <p>Read this page alongside <a href="Theory_Concurrency.html">Concurrency</a> and <a href="Theory_Ownership_And_Language.html">Ownership &amp; language</a> while browsing <code class="inline">include/</code>.</p>
+      </div>
+      <div class="qa">
+        <div class="q"><span class="tag">Q</span> C++17 vs MDS C++11 — why diverge?</div>
+        <div class="a">
+          <p>MDS stayed on C++11 for a tight sockets story. This repo’s curriculum is threads and modern library types; C++17 is the intentional floor.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <a href="index.html">← Theory index</a> · <a href="../PLAN.md">PLAN.md</a>
+    </footer>
+  </main>
+</div>
+<script src="theory.js"></script>
+</body>
+</html>

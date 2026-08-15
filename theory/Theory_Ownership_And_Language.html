@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ownership &amp; Language — Knowledge Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <a class="back" href="index.html">← Theory index</a>
+    <span class="toc-label">Contents</span>
+    <ol id="toc-list">
+      <li><a href="#handoff"><span class="num">01</span>Move hand-off</a></li>
+      <li><a href="#delete-copy"><span class="num">02</span>Copy-delete on queues</a></li>
+      <li><a href="#threadguard"><span class="num">03</span>ThreadGuard &amp; Rule of Five</a></li>
+      <li><a href="#zero-unique"><span class="num">04</span>Rule of Zero &amp; unique_ptr</a></li>
+      <li><a href="#nttp"><span class="num">05</span>SpscQueue&lt;T, N&gt;</a></li>
+      <li><a href="#lambdas"><span class="num">06</span>Lambdas &amp; captures</a></li>
+      <li><a href="#pitfalls"><span class="num">07</span>Pitfalls</a></li>
+      <li><a href="#decisions"><span class="num">08</span>Engineering decisions</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">Ownership <span class="brace">{</span> Move, RAII &amp; language <span class="brace">}</span></h1>
+      <p class="subtitle">How orders, shards, and threads are owned in this tree — move hand-off through SPSC queues, RAII joins, <code class="inline">unique_ptr&lt;Shard&gt;</code>, and the templates/lambdas that wire the pipeline.</p>
+    </header>
+
+    <section id="handoff">
+      <div class="section-head"><span class="idx">01</span><h2>Move hand-off across queues</h2></div>
+      <p><code class="inline">GatewayOrder</code> (<code class="inline">gateway_order.hpp</code>) is the ingress message: symbol id, LOB request, enqueue timestamp. At every hop there should be <strong>one clear owner</strong> — gateway local → ring slot → matcher local → outbound <code class="inline">PublishEvent</code>.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>gateway_order.hpp · make + push</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">// gateway stamps time, then moves into the shard ingress
+GatewayOrder go = src;
+go.enqueued_at = std::chrono::steady_clock::now();
+
+Shard&amp; shard = *shards_[go.symbol_id];
+if (!shard.ingress.try_push(std::move(go))) {
+  ingress_drops_.fetch_add(1, std::memory_order_relaxed);
+}
+// after a successful push, do not touch go</code></pre>
+      </div>
+      <p><code class="inline">SpscQueue::try_push(T&amp;&amp;)</code> moves into the ring; <code class="inline">try_pop</code> / <code class="inline">pop_wait</code> move out into the caller’s local. Prefer <code class="inline">std::move</code> even when the payload is POD — the habit documents exclusive hand-off and stays correct if the type grows later.</p>
+      <div class="card">
+        <span class="card-label">Decision</span>
+        <p><strong>Value types on the hot path, moved hop-to-hop.</strong> Rejected: <code class="inline">shared_ptr&lt;GatewayOrder&gt;</code> through the queue — shared mutable ownership fights the SPSC “one producer / one consumer” story and adds atomic refcount traffic for no gain.</p>
+      </div>
+    </section>
+
+    <section id="delete-copy">
+      <div class="section-head"><span class="idx">02</span><h2>Why copy is deleted on queue types</h2></div>
+      <p>An <code class="inline">SpscQueue</code> owns a ring, a mutex, and two condition variables. Copying it would duplicate synchronization state while two threads still believe they share one buffer — undefined and meaningless.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>spsc_queue.hpp · non-copyable</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">template &lt;typename T, std::size_t N&gt;
+class SpscQueue {
+public:
+  SpscQueue() = default;
+
+  // Queues are shared between two threads by *reference*.
+  // Copying would duplicate mutex/CV/ring state incorrectly.
+  SpscQueue(const SpscQueue&amp;) = delete;
+  SpscQueue&amp; operator=(const SpscQueue&amp;) = delete;
+
+  bool try_push(T&amp;&amp; item);
+  bool try_pop(T&amp; out);
+  // ...
+};</code></pre>
+      </div>
+      <p>The pipeline never relocates a live queue after workers start. Threads hold references into pipeline-owned storage; the type itself stays put. That is also why <code class="inline">Shard</code> (which embeds two queues) is not movable — see §04.</p>
+      <ul>
+        <li>Push: move <em>from</em> caller into a slot; caller drops ownership.</li>
+        <li>Pop: move <em>from</em> slot into caller storage; then advance head.</li>
+        <li>Do not return <code class="inline">const T&amp;</code> into a ring slot across threads.</li>
+      </ul>
+    </section>
+
+    <section id="threadguard">
+      <div class="section-head"><span class="idx">03</span><h2>ThreadGuard — RAII and the Rule of Five</h2></div>
+      <p>Destroying a still-joinable <code class="inline">std::thread</code> calls <code class="inline">std::terminate</code>. <code class="inline">ThreadGuard</code> (<code class="inline">thread_guard.hpp</code>) owns one thread and joins in <code class="inline">reset()</code> / the destructor so stack unwinding and early returns stay safe.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>thread_guard.hpp · special members</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">class ThreadGuard {
+public:
+  ThreadGuard() noexcept = default;
+  explicit ThreadGuard(std::thread&amp;&amp; t) noexcept : t_(std::move(t)) {}
+  ~ThreadGuard() { reset(); }  // join if joinable
+
+  ThreadGuard(const ThreadGuard&amp;) = delete;
+  ThreadGuard&amp; operator=(const ThreadGuard&amp;) = delete;
+
+  ThreadGuard(ThreadGuard&amp;&amp; other) noexcept : t_(std::move(other.t_)) {}
+  ThreadGuard&amp; operator=(ThreadGuard&amp;&amp; other) noexcept {
+    if (this != &amp;other) {
+      reset();                 // join current, then steal
+      t_ = std::move(other.t_);
+    }
+    return *this;
+  }
+
+  void join() { if (t_.joinable()) t_.join(); }
+  void reset() noexcept;       // join + become empty
+private:
+  std::thread t_{};
+};</code></pre>
+      </div>
+      <p><strong>Rule of Five:</strong> once you define a destructor (or any special member), consider all five — destructor, copy ctor, copy assign, move ctor, move assign. <code class="inline">ThreadGuard</code> deletes copy (two guards must not own one thread), defines move (steal + leave empty), and joins on destroy.</p>
+      <div class="card warn">
+        <span class="card-label">Join order</span>
+        <p>RAII joins on destroy, but you must still flip shutdown flags and <code class="inline">wake_all()</code> / notify CVs <em>before</em> guards go out of scope — otherwise join waits forever. <code class="inline">MultiSymbolPipeline::run</code> does that, then joins matchers and publisher explicitly.</p>
+      </div>
+    </section>
+
+    <section id="zero-unique">
+      <div class="section-head"><span class="idx">04</span><h2>Rule of Zero and <code class="inline">unique_ptr&lt;Shard&gt;</code></h2></div>
+      <p><strong>Rule of Zero:</strong> types that only hold values / standard RAII members need no custom special members — compiler defaults are correct. Prefer this for <code class="inline">GatewayOrder</code>, <code class="inline">PublishEvent</code>, and plain config structs.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>gateway_order.hpp · Rule of Zero</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">struct GatewayOrder {
+  SymbolId symbol_id{0};
+  lob::OrderRequest request{};
+  std::chrono::steady_clock::time_point enqueued_at{};
+  // no custom special members — move/copy as members allow
+};</code></pre>
+      </div>
+      <p><code class="inline">Shard</code> embeds two <code class="inline">SpscQueue</code>s (mutex + CV → non-copyable, and not safely relocatable while live). That makes <code class="inline">Shard</code> itself non-movable, so it cannot live <em>directly</em> in a resizing <code class="inline">std::vector&lt;Shard&gt;</code>.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>multi_symbol_pipeline.hpp · unique_ptr&lt;Shard&gt;</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">struct Shard {
+  SpscQueue&lt;GatewayOrder, kIngressQueueCapacity&gt; ingress;
+  SpscQueue&lt;PublishEvent, kEventQueueCapacity&gt; events;
+  lob::MatchingEngine engine;
+};
+
+// unique_ptr: Shard is not movable/copyable,
+// so it cannot live directly in a resizing std::vector.
+std::vector&lt;std::unique_ptr&lt;Shard&gt;&gt; shards_;
+
+for (std::size_t i = 0; i &lt; num_symbols_; ++i) {
+  shards_.push_back(std::make_unique&lt;Shard&gt;());
+}</code></pre>
+      </div>
+      <p>Same pattern for matcher guards: <code class="inline">std::vector&lt;std::unique_ptr&lt;ThreadGuard&gt;&gt;</code> when you need a growable collection of move-only RAII owners without relying on vector reallocation of the guard type itself during setup.</p>
+      <div class="card">
+        <span class="card-label">Decision</span>
+        <p><strong><code class="inline">unique_ptr</code> for non-movable heap ownership; values for messages.</strong> Rejected: forcing <code class="inline">Shard</code> to be movable just to sit in a vector. Rejected: <code class="inline">shared_ptr&lt;Shard&gt;</code> — exclusive ownership is enough; workers take raw refs into pipeline-owned storage that outlives the threads.</p>
+      </div>
+    </section>
+
+    <section id="nttp">
+      <div class="section-head"><span class="idx">05</span><h2><code class="inline">SpscQueue&lt;T, N&gt;</code> — type param + NTTP</h2></div>
+      <p>A class template is a blueprint. <code class="inline">T</code> is the payload type; <code class="inline">N</code> is a <strong>non-type template parameter</strong> (NTTP) — a compile-time capacity, not a runtime allocator argument. Instantiating <code class="inline">SpscQueue&lt;GatewayOrder, 1024&gt;</code> and <code class="inline">SpscQueue&lt;PublishEvent, 1024&gt;</code> yields two concrete types with the same algorithm.</p>
+      <table>
+        <tr><th>Param</th><th>Kind</th><th>Role here</th></tr>
+        <tr>
+          <td><code class="inline">typename T</code></td>
+          <td>Type</td>
+          <td><code class="inline">GatewayOrder</code>, <code class="inline">PublishEvent</code>, …</td>
+        </tr>
+        <tr>
+          <td><code class="inline">std::size_t N</code></td>
+          <td>Non-type</td>
+          <td>Fixed ring size via <code class="inline">std::array&lt;T, N&gt;</code></td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>spsc_queue.hpp · header shape</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">template &lt;typename T, std::size_t N&gt;
+class SpscQueue {
+  static_assert(N &gt;= 1, "SpscQueue capacity must be &gt;= 1");
+public:
+  static constexpr std::size_t capacity() noexcept { return N; }
+  bool try_push(T&amp;&amp; item);
+  bool try_pop(T&amp; out);
+  template &lt;typename StopPred&gt;
+  bool pop_wait(T&amp; out, StopPred&amp;&amp; stop);
+  void wake_all();
+private:
+  std::array&lt;T, N&gt; buf_{};
+  std::size_t head_{0}, tail_{0}, size_{0};
+  mutable std::mutex mu_;
+  std::condition_variable cv_not_empty_;
+  std::condition_variable cv_not_full_;
+};
+
+// Different N → different types (capacity is part of the contract)
+SpscQueue&lt;GatewayOrder, 512&gt;  a;
+SpscQueue&lt;GatewayOrder, 1024&gt; b;
+// a = b;  // ill-formed</code></pre>
+      </div>
+      <p><code class="inline">T</code> should be move-assignable. Capacity is part of the type contract for v1 — readable, allocator-free ring storage, easy to reason about under overload.</p>
+    </section>
+
+    <section id="lambdas">
+      <div class="section-head"><span class="idx">06</span><h2>Lambdas as thread entry — captures that matter</h2></div>
+      <p><code class="inline">std::thread</code> accepts any callable. Matcher and publisher entry points in <code class="inline">multi_symbol_pipeline.hpp</code> are short lambdas that close over pipeline state and call into <code class="inline">run_matcher_worker</code> / <code class="inline">run_publisher_multi</code>.</p>
+      <div class="code-wrap">
+        <div class="code-bar"><span>multi_symbol_pipeline.hpp · matcher lambda</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">ThreadGuard publisher{std::thread([this, event_ptrs] {
+  run_publisher_multi(event_ptrs, matchers_left_, wake_, log_,
+                      echo_stdout_, &amp;stats_);
+})};
+
+std::vector&lt;std::unique_ptr&lt;ThreadGuard&gt;&gt; matchers;
+for (std::size_t i = 0; i &lt; num_symbols_; ++i) {
+  matchers.push_back(std::make_unique&lt;ThreadGuard&gt;(std::thread([this, i] {
+    run_matcher_worker(shards_[i]-&gt;ingress, shards_[i]-&gt;events,
+                       shards_[i]-&gt;engine, ingress_done_, matchers_left_,
+                       event_drops_, &amp;wake_, &amp;stats_);
+  })));
+}</code></pre>
+      </div>
+      <table>
+        <tr><th>Capture</th><th>Means</th><th>Risk here</th></tr>
+        <tr>
+          <td><code class="inline">[&amp;]</code></td>
+          <td>All automatic vars by reference</td>
+          <td>Dangles if the lambda outlives the frame; loop index shared</td>
+        </tr>
+        <tr>
+          <td><code class="inline">[=]</code></td>
+          <td>All automatic vars by copy</td>
+          <td>Copies pointers/refs <em>inside</em> objects still shallow; <code class="inline">this</code> is a pointer copy</td>
+        </tr>
+        <tr>
+          <td><code class="inline">[this, i]</code></td>
+          <td>Pipeline pointer + index by value</td>
+          <td>Pattern used here — <code class="inline">Pipeline</code> / <code class="inline">run</code> frame must outlive join</td>
+        </tr>
+        <tr>
+          <td><code class="inline">[&amp;, i]</code></td>
+          <td>Refs default; copy <code class="inline">i</code></td>
+          <td>Usual alternative when closing over many locals by ref</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>classic loop bug</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-cpp">// BAD: all threads may see i == num_symbols_
+for (std::size_t i = 0; i &lt; num_symbols_; ++i) {
+  threads.emplace_back([&amp;]{ run(shards_[i]); });  // i by ref!
+}
+
+// GOOD: copy the index into the lambda
+for (std::size_t i = 0; i &lt; num_symbols_; ++i) {
+  threads.emplace_back([this, i]{ run(shards_[i]); });
+}</code></pre>
+      </div>
+      <p><strong>Avoid <code class="inline">std::function</code> on the hot path.</strong> Type erasure can allocate and always indirection-calls. Matcher → engine → event push stays direct. Optional hooks (test spies, rare stats backends) can use <code class="inline">std::function</code> at the edge — not inside every match.</p>
+      <div class="card warn">
+        <span class="card-label">this lifetime</span>
+        <p>Capturing <code class="inline">this</code> (explicitly or via <code class="inline">[=]</code>) does not extend the object. Join workers before destroying the pipeline; flip <code class="inline">ingress_done_</code> and wake queues first so loops exit.</p>
+      </div>
+    </section>
+
+    <section id="pitfalls">
+      <div class="section-head"><span class="idx">07</span><h2>Pitfalls</h2></div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4><code class="inline">shared_ptr</code> “just to be safe” on orders</h4>
+          <p>Hides who may mutate the message. Prefer exclusive moves of <code class="inline">GatewayOrder</code> / <code class="inline">PublishEvent</code>.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Copying a queue or returning refs into ring slots</h4>
+          <p>Copy is deleted for a reason. Peeking a <code class="inline">const T&amp;</code> out of the buffer races with the next push into that slot.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Capturing the loop index by reference</h4>
+          <p>All matchers collide on the same <code class="inline">i</code>. Copy the index: <code class="inline">[this, i]</code> or <code class="inline">[&amp;, i]</code>.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Assuming <code class="inline">[=]</code> deep-copies the pipeline</h4>
+          <p>It copies the <code class="inline">this</code> pointer, not the object. Member lifetime still ends at destruction — join first.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Joinable thread without RAII</h4>
+          <p>An early <code class="inline">return</code> or exception that skips <code class="inline">join()</code> terminates the process. Own threads with <code class="inline">ThreadGuard</code>.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4><code class="inline">std::function</code> inside every match</h4>
+          <p>Indirect calls and possible allocations add noise on the critical path. Keep type-erased hooks off the book’s hot section.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="decisions">
+      <div class="section-head"><span class="idx">08</span><h2>Engineering decisions</h2></div>
+      <table>
+        <tr><th>Topic</th><th>Choice</th><th>Where</th></tr>
+        <tr>
+          <td>Order ownership</td>
+          <td>Move value types hop-to-hop</td>
+          <td><code class="inline">gateway_order.hpp</code>, queues, matcher</td>
+        </tr>
+        <tr>
+          <td>Queue special members</td>
+          <td>Copy deleted; live queues not relocated</td>
+          <td><code class="inline">spsc_queue.hpp</code></td>
+        </tr>
+        <tr>
+          <td>Thread lifecycle</td>
+          <td>RAII <code class="inline">ThreadGuard</code> (Rule of Five)</td>
+          <td><code class="inline">thread_guard.hpp</code></td>
+        </tr>
+        <tr>
+          <td>Message types</td>
+          <td>Rule of Zero PODs / aggregates</td>
+          <td><code class="inline">GatewayOrder</code>, events</td>
+        </tr>
+        <tr>
+          <td>Non-movable shards</td>
+          <td><code class="inline">vector&lt;unique_ptr&lt;Shard&gt;&gt;</code></td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code></td>
+        </tr>
+        <tr>
+          <td>Queue shape</td>
+          <td><code class="inline">SpscQueue&lt;T, N&gt;</code> NTTP capacity</td>
+          <td><code class="inline">spsc_queue.hpp</code></td>
+        </tr>
+        <tr>
+          <td>Thread entry</td>
+          <td>Lambdas with <code class="inline">[this, i]</code>; no hot-path <code class="inline">std::function</code></td>
+          <td>pipeline + <code class="inline">matcher_worker.hpp</code></td>
+        </tr>
+      </table>
+      <div class="card">
+        <span class="card-label">Decision</span>
+        <p><strong>Exclusive move hand-off + RAII joins + <code class="inline">unique_ptr</code> for non-movable shards + compile-time queue capacity + explicit lambda captures.</strong> Rejected: shared ownership of in-flight orders; detached workers; peeking into ring slots; type-erased callables on the matcher critical path.</p>
+      </div>
+      <div class="card">
+        <span class="card-label">Related</span>
+        <p>Pipeline wiring: <a href="Theory_Architecture.html">Architecture</a>. Queue mechanics: <a href="Theory_Concurrency.html">Concurrency</a>. Feature map: <a href="Theory_CodeRef.html">C++ Code Reference</a>.</p>
+      </div>
+    </section>
+
+    <footer>
+      <a href="index.html">← Theory index</a> · <a href="../PLAN.md">PLAN.md</a>
+    </footer>
+  </main>
+</div>
+<script src="theory.js"></script>
+</body>
+</html>

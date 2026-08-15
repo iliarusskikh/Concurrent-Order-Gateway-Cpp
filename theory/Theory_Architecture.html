@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture — Knowledge Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="theory.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <a class="back" href="index.html">← Theory index</a>
+    <span class="toc-label">Contents</span>
+    <ol id="toc-list">
+      <li><a href="#purpose"><span class="num">01</span>Purpose</a></li>
+      <li><a href="#pipeline"><span class="num">02</span>Pipeline</a></li>
+      <li><a href="#dsl"><span class="num">03</span>Scenario DSL</a></li>
+      <li><a href="#roles"><span class="num">04</span>Thread roles</a></li>
+      <li><a href="#reuse"><span class="num">05</span>Reuse vs invent</a></li>
+      <li><a href="#modules"><span class="num">06</span>Modules</a></li>
+      <li><a href="#decisions"><span class="num">07</span>Design decisions</a></li>
+      <li><a href="#rejected"><span class="num">08</span>Rejected alternatives</a></li>
+    </ol>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <span class="eyebrow">Concurrent Order Gateway · Knowledge notes</span>
+      <h1 class="title">Architecture <span class="brace">{</span> Pipeline &amp; decisions <span class="brace">}</span></h1>
+      <p class="subtitle">How orders move through threads in this repository, which pieces are reused from the LOB / MDS companions, and which design choices are locked for v1.</p>
+    </header>
+
+    <section id="purpose">
+      <div class="section-head"><span class="idx">01</span><h2>Purpose</h2></div>
+      <p>The LOB project already matches orders for one instrument on one thread. The MDS project already pushes market data over TCP. This project fills the gap between them: a <strong>concurrent ingress and fan-out path</strong> into matching.</p>
+      <div class="card">
+        <span class="card-label">Core idea</span>
+        <p>Keep each book single-threaded for correctness. Put concurrency in the plumbing — queues, sharding, publisher — not inside the match loop.</p>
+      </div>
+    </section>
+
+    <section id="pipeline">
+      <div class="section-head"><span class="idx">02</span><h2>Pipeline</h2></div>
+      <div class="code-wrap">
+        <div class="code-bar"><span>v1 data path</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-text">scenario / CLI
+      │
+      ▼
+ Gateway (this thread in MultiSymbolPipeline::run)
+      │  route by symbol_id
+      ├─ ingress[0] ─► matcher 0 (engine 0) ─► events[0] ─┐
+      ├─ ingress[1] ─► matcher 1 (engine 1) ─► events[1] ─┼─► publisher
+      └─ ingress[N] ─► matcher N (engine N) ─► events[N] ─┘
+                                                         │
+                                                         ▼
+                                              EventLog + latency_stats</code></pre>
+      </div>
+      <p>Each <code class="inline">ingress[i]</code> and <code class="inline">events[i]</code> is an SPSC queue. Sharing one event queue across matchers would make that hop MPSC and break the SPSC contract used elsewhere.</p>
+    </section>
+
+    <section id="dsl">
+      <div class="section-head"><span class="idx">03</span><h2>Scenario DSL</h2></div>
+      <p>Ingress is a text file loaded by <code class="inline">scenario_loader.hpp</code> (CLI: <code class="inline">./gateway path [num_symbols]</code>). Assertions live in C++ tests — the loader only feeds orders.</p>
+      <table>
+        <tr><th>Line</th><th>Meaning</th></tr>
+        <tr>
+          <td><code class="inline">NEW id SIDE TYPE qty price</code></td>
+          <td>Limit/market order; default <code class="inline">symbol_id = 0</code></td>
+        </tr>
+        <tr>
+          <td><code class="inline">… SYM n</code></td>
+          <td>Same, routed to shard <code class="inline">n</code></td>
+        </tr>
+        <tr>
+          <td><code class="inline"># comment</code> / blank</td>
+          <td>Ignored</td>
+        </tr>
+        <tr>
+          <td><code class="inline">CANCEL …</code></td>
+          <td>Recognized by the parser but <strong>skipped</strong> in v1 (matcher path is submit-only)</td>
+        </tr>
+      </table>
+      <div class="code-wrap">
+        <div class="code-bar"><span>scenarios/multi_symbol_demo.txt</span><button class="copy-btn" onclick="copyCode(this)">copy</button></div>
+        <pre><code class="language-text">NEW 1 BUY  LIMIT 10 100 SYM 0
+NEW 2 SELL LIMIT 10 100 SYM 0
+NEW 1 BUY  LIMIT 5  50  SYM 1
+NEW 2 SELL LIMIT 5  50  SYM 1</code></pre>
+      </div>
+      <p class="dim">Examples: <code class="inline">scenarios/one_symbol_demo.txt</code>, <code class="inline">scenarios/multi_symbol_demo.txt</code>. Field order is <code class="inline">qty</code> then <code class="inline">price</code> (same as LOB DSL).</p>
+    </section>
+
+    <section id="roles">
+      <div class="section-head"><span class="idx">04</span><h2>Thread roles</h2></div>
+      <table>
+        <tr><th>Role</th><th>Owns</th><th>Code</th></tr>
+        <tr>
+          <td>Gateway</td>
+          <td>Routing, enqueue, drop counters</td>
+          <td><code class="inline">multi_symbol_pipeline.hpp</code> (<code class="inline">run</code>)</td>
+        </tr>
+        <tr>
+          <td>Matcher <em>i</em></td>
+          <td><code class="inline">MatchingEngine</code> for symbol <em>i</em></td>
+          <td><code class="inline">matcher_worker.hpp</code></td>
+        </tr>
+        <tr>
+          <td>Publisher</td>
+          <td>Formatting, <code class="inline">EventLog</code>, publish-side latency</td>
+          <td><code class="inline">publisher.hpp</code></td>
+        </tr>
+      </table>
+      <p>Shutdown order: finish producing → set <code class="inline">ingress_done</code> → wake ingress queues → join matchers (they decrement <code class="inline">matchers_left</code>) → publisher drains events → join publisher.</p>
+    </section>
+
+    <section id="reuse">
+      <div class="section-head"><span class="idx">05</span><h2>Reuse vs invent</h2></div>
+      <table>
+        <tr><th>From</th><th>Reuse</th><th>Do not rebuild here</th></tr>
+        <tr>
+          <td>LOB</td>
+          <td><code class="inline">include/lob/*</code> types + <code class="inline">MatchingEngine</code></td>
+          <td>Price-time book internals as a learning goal</td>
+        </tr>
+        <tr>
+          <td>TCP MDS</td>
+          <td>Latency percentile habit; RAII mindset</td>
+          <td>Sockets / <code class="inline">poll</code> in v1</td>
+        </tr>
+        <tr>
+          <td>This repo</td>
+          <td>—</td>
+          <td>Queues, shards, thread lifecycle, backpressure, stats wiring</td>
+        </tr>
+      </table>
+    </section>
+
+    <section id="modules">
+      <div class="section-head"><span class="idx">06</span><h2>Modules</h2></div>
+      <table>
+        <tr><th>Header</th><th>Responsibility</th></tr>
+        <tr><td><code class="inline">gateway_order.hpp</code></td><td>Queue message: symbol + <code class="inline">OrderRequest</code> + enqueue time</td></tr>
+        <tr><td><code class="inline">scenario_loader.hpp</code></td><td>Parse <code class="inline">NEW … [SYM n]</code> into <code class="inline">GatewayOrder</code>s</td></tr>
+        <tr><td><code class="inline">spsc_queue.hpp</code></td><td>Bounded SPSC template</td></tr>
+        <tr><td><code class="inline">thread_guard.hpp</code></td><td>Join on destruction</td></tr>
+        <tr><td><code class="inline">matcher_worker.hpp</code></td><td>Pop → submit → push <code class="inline">PublishEvent</code></td></tr>
+        <tr><td><code class="inline">publisher.hpp</code></td><td>Drain event queues; format; sample publish latency</td></tr>
+        <tr><td><code class="inline">multi_symbol_pipeline.hpp</code></td><td>Shards, threads, routing, shutdown</td></tr>
+        <tr><td><code class="inline">latency_stats.hpp</code></td><td>p50 / p99 histograms</td></tr>
+        <tr><td><code class="inline">lob/*</code></td><td>Vendored matching core</td></tr>
+      </table>
+    </section>
+
+    <section id="decisions">
+      <div class="section-head"><span class="idx">07</span><h2>Design decisions</h2></div>
+      <table>
+        <tr><th>Topic</th><th>Choice</th><th>Rationale</th></tr>
+        <tr><td>Sharding</td><td>One matcher thread per symbol</td><td>Book never shared across threads</td></tr>
+        <tr><td>Queues</td><td>Mutex + CV SPSC, capacity fixed at compile time</td><td>Readable; tested; enough for this scale</td></tr>
+        <tr><td>Events</td><td>Per-shard event SPSC</td><td>Preserves SPSC; publisher uses <code class="inline">EventWake</code></td></tr>
+        <tr><td>Full queue</td><td>Drop + atomic counter</td><td>Overload is observable</td></tr>
+        <tr><td>Ingress</td><td>Scenario file / CLI</td><td>Isolates concurrency from networking</td></tr>
+        <tr><td>Dialect</td><td>C++17</td><td>Threads, atomics, chrono, templates</td></tr>
+      </table>
+    </section>
+
+    <section id="rejected">
+      <div class="section-head"><span class="idx">08</span><h2>Rejected alternatives</h2></div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>One shared book + big mutex</h4>
+          <p>Works in demos but teaches locking theater instead of ownership boundaries. Sharding removes the need to lock the book.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>N matchers → one shared event queue</h4>
+          <p>That hop becomes MPSC. v1 keeps one event SPSC per matcher.</p>
+        </div>
+      </div>
+      <div class="pitfall">
+        <span class="icon">✕</span>
+        <div>
+          <h4>Lock-free matching book in v1</h4>
+          <p>Easy to get wrong; weakens the “shipped and tested” bar. Optional later behind the same worker API.</p>
+        </div>
+      </div>
+      <div class="card">
+        <span class="card-label">Related</span>
+        <p>Deeper concurrency mechanics: <a href="Theory_Concurrency.html">Theory_Concurrency.html</a>. Ownership and language features: <a href="Theory_Ownership_And_Language.html">Theory_Ownership_And_Language.html</a>.</p>
+      </div>
+    </section>
+
+    <footer>
+      <a href="index.html">← Theory index</a> · <a href="../PLAN.md">PLAN.md</a>
+    </footer>
+  </main>
+</div>
+<script src="theory.js"></script>
+</body>
+</html>
