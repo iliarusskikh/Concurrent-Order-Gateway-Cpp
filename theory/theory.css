@@ -314,6 +314,53 @@ tr:last-child td { border-bottom: none; }
 }
 .qa .a p { margin-bottom: 10px; }
 .qa .a p:last-child { margin-bottom: 0; }
+.qa .a ul { margin: 0 0 10px; padding-left: 20px; }
+.qa .a li { margin-bottom: 4px; color: var(--text-dim); }
+
+/* Collapsible interview prep Q&A */
+details.qa > summary.q {
+  list-style: none;
+  cursor: pointer;
+  align-items: flex-start;
+}
+details.qa > summary.q::-webkit-details-marker { display: none; }
+details.qa > summary.q::after {
+  content: "+";
+  margin-left: auto;
+  font-family: var(--mono);
+  color: var(--text-faint);
+  font-weight: 400;
+  flex-shrink: 0;
+}
+details.qa[open] > summary.q::after { content: "−"; }
+details.qa > summary.q:hover { background: var(--bg-raised); }
+.prep-hint {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: -8px 0 20px;
+}
+.prep-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 28px;
+  font-family: var(--sans);
+}
+.prep-controls button {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.prep-controls button:hover {
+  color: var(--text);
+  border-color: var(--acquire-dim);
+}
 
 .pitfall {
   display: flex;
