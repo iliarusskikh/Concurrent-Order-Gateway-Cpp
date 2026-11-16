@@ -4,11 +4,10 @@ Multi-threaded **order gateway + matching pipeline**: ingress validates and shar
 
 Companion to the [TCP Market Data Simulator](https://github.com/iliarusskikh/TCP-Market-Data-Simulator-Cpp) (I/O + framing) and the [Limit Order Book](https://github.com/iliarusskikh/Limit-Order-Book-and-Matching-Engine-Cpp) (single-threaded matching). **No third-party libraries** beyond the C++ standard library (CMake to build).
 
-**Scope (v1):** CLI / file ingress. Bounded SPSC queues, shard-by-symbol, mutex + condition variables. LOB reused as a black box. No TCP, no lock-free book.
+**Scope (v1):** CLI / file ingress. Bounded SPSC queues, shard-by-symbol, mutex + condition variables. LOB reused as a black box. No TCP, no lock-free book. v1 complete (phases 0–5).
 
 | Doc | Purpose |
 |-----|---------|
-| [`PLAN.md`](PLAN.md) | Roadmap, scope cuts, reading order |
 | [`theory/index.html`](theory/index.html) | Knowledge notes for concepts used in this tree |
 | [`LICENSE`](LICENSE) | MIT |
 
@@ -16,7 +15,7 @@ Companion to the [TCP Market Data Simulator](https://github.com/iliarusskikh/TCP
 
 ## What it does
 
-Orders enter from a scenario file. The gateway routes each order by `symbol_id` onto that symbol’s ingress queue. A dedicated matcher thread owns that symbol’s `MatchingEngine`, matches, and pushes events onto a per-shard event queue. A publisher thread drains those events to stdout / an in-memory log and records latency samples.
+Orders enter from a scenario file (`NEW …` / optional `SYM <id>`). The gateway routes each order by `symbol_id` onto that symbol’s ingress queue. A dedicated matcher thread owns that symbol’s `MatchingEngine`, matches, and pushes events onto a per-shard event queue. A publisher thread drains those events to stdout / an in-memory log and records latency samples.
 
 ```text
 CLI / scenario file
@@ -32,7 +31,9 @@ CLI / scenario file
                                               + latency histograms
 ```
 
-Per-shard **event** queues keep each hop SPSC (sharing one event queue across matchers would be MPSC).
+Per-shard **event** queues keep each hop SPSC (sharing one event queue across matchers would be MPSC). The publisher round-robins and waits on `EventWake`. `Shard` holds mutexes → stored as `unique_ptr<Shard>`.
+
+Drop counters: ingress full, event full, unknown symbol.
 
 ---
 
@@ -47,6 +48,8 @@ Per-shard **event** queues keep each hop SPSC (sharing one event queue across ma
 | Publisher → log / stdout | Full mini-exchange + GUI |
 | Latency histograms (queue / match / publish) | CPU pinning, rdtsc, huge pages |
 | Unit + concurrency smoke tests | Rewriting LOB matching logic |
+
+Deliberate cuts: TCP already covered by MDS; lock-free ring harder to verify (same API later); shared global book conflicts with shard ownership.
 
 ---
 
@@ -64,6 +67,18 @@ Per-shard **event** queues keep each hop SPSC (sharing one event queue across ma
 
 ---
 
+## Latency metrics
+
+| Metric | Definition |
+|--------|------------|
+| `queue_wait` | `match_started_at - enqueued_at` (per order) |
+| `match_duration` | `matched_at - match_started_at` (per order) |
+| `match_to_publish` | `published_at - matched_at` (per published event) |
+
+Reported at shutdown as p50 / p99 (and min / max).
+
+---
+
 ## C++ concepts in this tree
 
 | Concept | Where |
@@ -76,7 +91,7 @@ Per-shard **event** queues keep each hop SPSC (sharing one event queue across ma
 | Lambdas | Thread entry, CV stop predicates |
 | Templates | `SpscQueue<T, N>` |
 
-Knowledge notes: [`theory/index.html`](theory/index.html).
+Knowledge notes: [`theory/index.html`](theory/index.html) (architecture → concurrency → ownership → latency → testing → code ref).
 
 ---
 
@@ -85,7 +100,6 @@ Knowledge notes: [`theory/index.html`](theory/index.html).
 ```
 ├── CMakeLists.txt
 ├── LICENSE
-├── PLAN.md
 ├── README.md
 ├── include/          # gateway plumbing + vendored lob/
 ├── src/main.cpp
@@ -112,9 +126,17 @@ cmake --build build
 ./build/gateway scenarios/multi_symbol_demo.txt 2
 ```
 
-Latency report at shutdown: `queue_wait` / `match_duration` / `match_to_publish`.
-
 **Suggested code reading order:** `gateway_order.hpp` → `spsc_queue.hpp` → `thread_guard.hpp` → `matcher_worker.hpp` → `publisher.hpp` → `multi_symbol_pipeline.hpp` → `latency_stats.hpp` → `src/main.cpp`.
+
+---
+
+## Optional next work
+
+1. TCP ingress (reuse MDS framing or a thin length-prefixed DSL)
+2. Lock-free SPSC behind the same queue API; compare histograms
+3. Object pool for order nodes under load
+4. MPSC ingress fan-in (multiple producers into a router)
+5. Bounded event-side backpressure toward a slow publisher
 
 ---
 
