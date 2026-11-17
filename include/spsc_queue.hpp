@@ -74,6 +74,7 @@ public:
   }
 
   // -------------------------------------------------------------------------
+  // actually used by the matcher worker
   // try_push — non-blocking produce
   //
   //   If there is room: move `item` into the ring, notify a waiting consumer,
@@ -151,6 +152,7 @@ public:
   }
 
   // -------------------------------------------------------------------------
+  // actually used by the publisher worker
   // pop_wait — blocking consume
   //
   //   Wait until an item appears OR `stop` becomes true.
@@ -171,7 +173,8 @@ public:
     head_ = next(head_);
     --size_;
     lock.unlock();
-    cv_not_full_.notify_one();
+    cv_not_full_.notify_one(); // notify the publisher worker that there is now room in the queue
+    // not used in the matcher worker
     return true;
   }
 
