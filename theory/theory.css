@@ -314,8 +314,10 @@ tr:last-child td { border-bottom: none; }
 }
 .qa .a p { margin-bottom: 10px; }
 .qa .a p:last-child { margin-bottom: 0; }
-.qa .a ul { margin: 0 0 10px; padding-left: 20px; }
+.qa .a ul, .qa .a ol { margin: 0 0 10px; padding-left: 20px; }
 .qa .a li { margin-bottom: 4px; color: var(--text-dim); }
+.qa .a .code-wrap { margin: 12px 0 14px; }
+.qa .a table { font-size: 13.5px; margin: 12px 0 14px; }
 
 /* Collapsible interview prep Q&A */
 details.qa > summary.q {
